@@ -1,0 +1,149 @@
+name: Sync fork
+
+# Keeps this fork's default branch level with upstream, and refuses to sync when
+# upstream no longer looks like the same repository:
+#   - deleted, renamed away, or made private  -> unreachable
+#   - emptied (no HEAD, no tracked branch, or an empty tree)
+#   - recreated (history no longer shares a root commit with this fork)
+# The upstream is read from the fork's own parent link, so a rename is followed
+# and a deleted upstream is reported instead of being guessed. Set the
+# UPSTREAM_REPO repository variable (owner/name) to override it.
+# A push made with GITHUB_TOKEN does not start this fork's own workflows.
+
+on:
+  schedule:
+    - cron: "17 19 * * *" # 03:17 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Sync even if upstream history was replaced
+        type: boolean
+        default: false
+      dry_run:
+        description: Check and merge, but do not push
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check that upstream still looks healthy
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE: ${{ vars.UPSTREAM_REPO }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+
+          skip() {
+            echo "::warning::$1"
+            {
+              echo "### Sync skipped"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # 0. Which repository is upstream? Its own parent link is the source of
+          #    truth; when the parent was deleted the fork is detached and the
+          #    link is gone, which is exactly what we must not merge from.
+          if [ -n "${OVERRIDE}" ]; then
+            upstream=${OVERRIDE}
+          else
+            upstream=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty') \
+              || skip "Could not read this fork's parent repository; nothing was synced."
+            if [ -z "${upstream}" ]; then
+              skip "This repository has no parent any more (upstream deleted or detached); nothing was synced."
+            fi
+          fi
+          echo "Upstream: ${upstream}"
+
+          url="https://github.com/${upstream}.git"
+
+          # 1. The upstream repository must still exist and answer.
+          rc=0
+          err=$(git ls-remote --exit-code "$url" HEAD 2>&1 >/dev/null) || rc=$?
+          case "$rc" in
+            0) ;;
+            2) skip "Upstream ${upstream} is empty (no HEAD); nothing was synced." ;;
+            *) skip "Upstream ${upstream} is unreachable (deleted, renamed away, or private): $(printf '%s' "$err" | head -n 1)" ;;
+          esac
+
+          # 2. The branch this fork tracks must still exist upstream.
+          if ! git ls-remote --exit-code --heads "$url" "$BRANCH" >/dev/null 2>&1; then
+            skip "Upstream ${upstream} has no '${BRANCH}' branch; nothing was synced."
+          fi
+
+          git remote add upstream "$url" 2>/dev/null || git remote set-url upstream "$url"
+          if ! git fetch --no-tags --prune upstream "$BRANCH"; then
+            skip "Could not fetch ${upstream} ${BRANCH}; nothing was synced."
+          fi
+
+          # 3. Upstream must still contain files.
+          files=$(git ls-tree -r --name-only "upstream/${BRANCH}" | wc -l)
+          if [ "$files" -eq 0 ]; then
+            skip "Upstream ${upstream} has no files on ${BRANCH} (emptied); nothing was synced."
+          fi
+
+          # 4. Upstream must still share history with this fork; a replaced history
+          #    means the repository was recreated or reset rather than updated.
+          shared=""
+          while IFS= read -r root; do
+            if git merge-base --is-ancestor "$root" HEAD; then shared=$root; break; fi
+          done < <(git rev-list --max-parents=0 "upstream/${BRANCH}")
+          if [ -z "$shared" ]; then
+            if [ "${FORCE}" = "true" ]; then
+              echo "::warning::Upstream history no longer shares a root commit with this fork; continuing because force was requested."
+            else
+              skip "Upstream ${upstream} history was replaced (no shared root commit); nothing was synced. Re-run with force=true if this is intended."
+            fi
+          fi
+
+          echo "Upstream ${upstream} looks healthy: ${files} files on ${BRANCH}."
+          echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream and push
+        if: steps.guard.outputs.skipped != 'true'
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          before=$(git rev-parse HEAD)
+          if ! git merge --no-edit "upstream/${BRANCH}"; then
+            echo "::error::Merge conflict with upstream/${BRANCH}; resolve it in this fork."
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ]; then
+            echo "Already up to date with upstream/${BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${DRY_RUN}" = "true" ]; then
+            git push --dry-run origin "HEAD:${BRANCH}"
+            echo "Dry run: would sync ${BRANCH} ${before:0:12} -> ${after:0:12}." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git push origin "HEAD:${BRANCH}"
+          echo "Synced ${BRANCH}: ${before:0:12} -> ${after:0:12}" | tee -a "$GITHUB_STEP_SUMMARY"
